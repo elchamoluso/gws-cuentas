@@ -1,0 +1,782 @@
+#!/usr/bin/env bash
+# gcuenta — herramienta del protocolo gws-cuentas.
+#
+# Dice qué cuenta Google aplica en cada carpeta, comprueba el estado de las tres
+# herramientas (gws, gcloud, clasp) por cuenta, hace los logins comprobando el email antes
+# de guardar nada, abre el navegador de cada cuenta y alimenta el hook de Claude Code.
+set -u
+
+kit=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+# shellcheck source=../lib/cuentas.sh
+. "$kit/lib/cuentas.sh"
+
+GC_LOG=$GCUENTAS_CACHE/gcuenta.log
+
+info() { printf '%s\n' "$*" >&2; }
+die() {
+    _gc_err "$*"
+    exit 1
+}
+
+uso() {
+    cat <<'EOF'
+gcuenta — una cuenta Google por carpeta para gws, gcloud y clasp
+
+  gcuenta [cual [ruta]]        qué cuenta aplica aquí (o en la ruta) y por qué
+  gcuenta id [ruta]            solo el id
+  gcuenta lista                cuentas y reglas configuradas
+  gcuenta env [id]             variables de entorno de la cuenta (para eval)
+  gcuenta estado [id|--todas]  comprueba en vivo gws, gcloud y clasp (y guarda la caché del hook)
+  gcuenta login <id> <gws|gcloud|clasp>
+                               login con el navegador de esa cuenta; verifica el email antes de guardar
+  gcuenta entrar <id>          pestaña para iniciar sesión con esa cuenta en el navegador compartido
+  gcuenta abrir <id> <url>     abre una URL con esa cuenta (authuser / login_hint)
+  gcuenta nav <id> <args…>     agent-browser conectado al navegador compartido («open» añade la cuenta)
+  gcuenta url <id> <url>       imprime la URL con la cuenta puesta
+  gcuenta cerrar               cierra el navegador compartido
+  gcuenta hook                 texto para el hook SessionStart de Claude Code (offline)
+  gcuenta doctor               revisa la instalación
+
+Para un comando suelto con otra cuenta: GCUENTA=<id> gws …
+EOF
+}
+
+requiere_cuenta() {
+    [ -n "${1:-}" ] || die "falta el id de la cuenta (${CUENTAS_IDS[*]})"
+    cuenta_existe "$1" || die "«$1» no es una cuenta configurada (${CUENTAS_IDS[*]})"
+    cuentas_dirs "$1"
+}
+
+preparar_cache() {
+    mkdir -p "$GCUENTAS_CACHE" && chmod 700 "$GCUENTAS_CACHE"
+}
+
+json_campo() { # json_campo <campo> < json   → valor (vacío si no está)
+    python3 -I -c '
+import json, sys
+campo = sys.argv[1]
+texto = sys.stdin.read()
+i = texto.find("{")
+try:
+    datos = json.loads(texto[i:]) if i >= 0 else {}
+except Exception:
+    datos = {}
+v = datos.get(campo, "")
+print(json.dumps(v) if isinstance(v, (dict, list)) else ("true" if v is True else "false" if v is False else v))
+' "$1" 2>/dev/null
+}
+
+minusculas() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+# ---------------------------------------------------------------- consulta
+
+cmd_cual() {
+    cuentas_resolver "${1-}" || exit 2
+    local id=$GC_ID proy=${CUENTA_PROYECTO[$GC_ID]:-}
+    printf '%s · %s · proyecto %s · (%s)\n' "$id" "${CUENTA_EMAIL[$id]}" "${proy:-sin fijar}" "$GC_MOTIVO"
+}
+
+cmd_id() {
+    cuentas_resolver "${1-}" || exit 2
+    printf '%s\n' "$GC_ID"
+}
+
+cmd_lista() {
+    local id i
+    printf 'Cuentas (máquina: %s):\n' "${GCUENTAS_MAQUINA:-sin nombre}"
+    for id in "${CUENTAS_IDS[@]}"; do
+        printf '  %-16s %-34s %-10s proyecto %s%s\n' "$id" "${CUENTA_EMAIL[$id]}" "${CUENTA_TIPO[$id]}" \
+            "${CUENTA_PROYECTO[$id]:-—}" "$([ "$id" = "$CUENTA_DEFECTO" ] && printf '  [defecto]')"
+    done
+    printf 'Reglas (gana el prefijo más largo):\n'
+    for i in "${!RUTAS_PREFIJO[@]}"; do
+        printf '  %-60s → %s\n' "${RUTAS_PREFIJO[$i]}" "${RUTAS_ID[$i]}"
+    done
+    [ -n "$GCUENTAS_CONECTORES" ] && printf 'Conectores de claude.ai: %s (%s)\n' "$GCUENTAS_CONECTORES" "${CUENTA_EMAIL[$GCUENTAS_CONECTORES]}"
+    return 0
+}
+
+cmd_env() {
+    local id=${1-}
+    if [ -z "$id" ]; then
+        cuentas_resolver || exit 2
+        id=$GC_ID
+    fi
+    requiere_cuenta "$id"
+    printf 'export GCUENTA=%q\n' "$id"
+    printf 'export GOOGLE_WORKSPACE_CLI_CONFIG_DIR=%q\n' "$GC_GWS_DIR"
+    printf 'export GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND=file\n'
+    printf 'export CLOUDSDK_CONFIG=%q\n' "$GC_GCLOUD_DIR"
+    printf 'export clasp_config_auth=%q\n' "$GC_CLASP_AUTH"
+}
+
+# ---------------------------------------------------------------- estado
+
+estado_cuenta() { # estado_cuenta <id> → imprime el resumen y escribe la caché; 0 si todo OK
+    local id=$1 email proy
+    requiere_cuenta "$id"
+    email=$(minusculas "${CUENTA_EMAIL[$id]}")
+    proy=${CUENTA_PROYECTO[$id]:-}
+
+    local gws_ok=false gws_det="sin credenciales" gws_user="" gws_scopes=0 salida tv
+    if [ -s "$GC_GWS_DIR/credentials.enc" ] && [ -x "$GC_GWS_BIN" ]; then
+        salida=$(cd "$(cuentas_dir_ejecucion)" && (cuentas_entorno_gws "$id"; timeout 40 "$GC_GWS_BIN" auth status) 2>/dev/null) || true
+        gws_user=$(printf '%s' "$salida" | json_campo user)
+        tv=$(printf '%s' "$salida" | json_campo token_valid)
+        gws_scopes=$(printf '%s' "$salida" | json_campo scope_count)
+        gws_scopes=${gws_scopes:-0}
+        if [ "$tv" = true ] && [ "$(minusculas "$gws_user")" = "$email" ]; then
+            gws_ok=true
+            gws_det="$gws_scopes scopes"
+        elif [ "$tv" = true ]; then
+            gws_det="token de OTRA cuenta: $gws_user"
+        else
+            gws_det="token no válido: reautenticar con «gcuenta login $id gws»"
+        fi
+    elif [ ! -s "$GC_GWS_DIR/client_secret.json" ]; then
+        gws_det="falta client_secret.json"
+    fi
+
+    local gc_ok=false gc_det="sin login" gc_cuenta="" gc_proy=""
+    if [ -d "$GC_GCLOUD_DIR" ] && [ -x "$GC_GCLOUD_BIN_DIR/gcloud" ]; then
+        gc_cuenta=$(cd "$HOME" && (cuentas_entorno_gcloud; timeout 40 "$GC_GCLOUD_BIN_DIR/gcloud" auth list \
+            --filter=status:ACTIVE --format='value(account)' 2>/dev/null)) || true
+        gc_proy=$(cd "$HOME" && (cuentas_entorno_gcloud; timeout 40 "$GC_GCLOUD_BIN_DIR/gcloud" config get-value \
+            project 2>/dev/null)) || true
+        if [ -n "$gc_cuenta" ]; then
+            if [ "$(minusculas "$gc_cuenta")" != "$email" ]; then
+                gc_det="cuenta activa equivocada: $gc_cuenta"
+            elif (cd "$HOME" && cuentas_entorno_gcloud && timeout 40 "$GC_GCLOUD_BIN_DIR/gcloud" auth \
+                print-access-token >/dev/null 2>&1); then
+                gc_ok=true
+                gc_det="proyecto ${gc_proy:-sin fijar}"
+            else
+                gc_det="hay que reautenticar («gcuenta login $id gcloud»)"
+            fi
+        fi
+    fi
+
+    local cl_ok=false cl_det="sin login" cl_email=""
+    if [ -s "$GC_CLASP_AUTH" ] && [ -x "$GC_CLASP_BIN" ]; then
+        salida=$(cd "$HOME" && (cuentas_entorno_clasp; timeout 40 "$GC_CLASP_BIN" --json show-authorized-user) 2>/dev/null) || true
+        cl_email=$(printf '%s' "$salida" | json_campo email)
+        if [ -n "$cl_email" ] && [ "$(minusculas "$cl_email")" = "$email" ]; then
+            cl_ok=true
+            cl_det="ok"
+        elif [ -n "$cl_email" ]; then
+            cl_det="login de OTRA cuenta: $cl_email"
+        else
+            cl_det="hay que reautenticar («gcuenta login $id clasp»)"
+        fi
+    fi
+
+    local marca
+    printf '%s  %s%s\n' "$id" "${CUENTA_EMAIL[$id]}" "${proy:+  · proyecto $proy}"
+    for marca in "gws:$gws_ok:$gws_det" "gcloud:$gc_ok:$gc_det" "clasp:$cl_ok:$cl_det"; do
+        IFS=: read -r h ok det <<<"$marca"
+        printf '  %-7s %s  %s\n' "$h" "$([ "$ok" = true ] && printf 'OK' || printf '✗ ')" "$det"
+    done
+
+    preparar_cache
+    python3 -I - "$GCUENTAS_CACHE/estado-$id.json" "$id" "${CUENTA_EMAIL[$id]}" \
+        "$gws_ok" "$gws_det" "$gws_scopes" "$gc_ok" "$gc_det" "$gc_proy" "$cl_ok" "$cl_det" <<'PY'
+import json, os, sys, time
+(ruta, id_, email, gws_ok, gws_det, gws_scopes, gc_ok, gc_det, gc_proy, cl_ok, cl_det) = sys.argv[1:]
+datos = {
+    "fecha": int(time.time()), "id": id_, "email": email,
+    "gws": {"ok": gws_ok == "true", "detalle": gws_det, "scopes": int(gws_scopes or 0)},
+    "gcloud": {"ok": gc_ok == "true", "detalle": gc_det, "proyecto": gc_proy},
+    "clasp": {"ok": cl_ok == "true", "detalle": cl_det},
+}
+tmp = ruta + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(datos, f, ensure_ascii=False)
+os.chmod(tmp, 0o600)
+os.replace(tmp, ruta)
+PY
+    [ "$gws_ok" = true ] && [ "$gc_ok" = true ] && [ "$cl_ok" = true ]
+}
+
+cmd_estado() {
+    local objetivo=${1-} id fallos=0
+    local -a ids=()
+    case $objetivo in
+        --todas | -a) ids=("${CUENTAS_IDS[@]}") ;;
+        "")
+            cuentas_resolver || exit 2
+            ids=("$GC_ID")
+            ;;
+        *) ids=("$objetivo") ;;
+    esac
+    for id in "${ids[@]}"; do
+        estado_cuenta "$id" || fallos=$((fallos + 1))
+    done
+    [ $fallos -eq 0 ]
+}
+
+# ---------------------------------------------------------------- navegador
+# Un solo Chromium con las sesiones de Google de TODAS las cuentas, que se queda abierto.
+# agent-browser se CONECTA a él por CDP (puerto solo en localhost) y nunca lo lanza: con
+# los flags con los que agent-browser arranca Chromium, Google revoca las sesiones. La
+# cuenta de cada página se elige con authuser=<email> (o login_hint en accounts.google.com).
+
+GC_DESCARGAS=${GCUENTAS_DESCARGAS:-$HOME/.local/share/gws-cuentas/descargas}
+NAV_FLAGS=(--password-store=basic --no-first-run --no-default-browser-check)
+
+url_con_cuenta() { # url_con_cuenta <email> <url> → la misma URL, abierta con esa cuenta
+    python3 -I -c '
+import sys, urllib.parse as up
+email, url = sys.argv[1], sys.argv[2]
+base, almohadilla, fragmento = url.partition("#")
+p = up.urlsplit(base)
+if "://" not in base and not base.startswith("/"):
+    # «console.cloud.google.com/...» sin esquema: solo se normalizan los hosts de Google.
+    q = up.urlsplit("https://" + base)
+    if q.hostname == "google.com" or (q.hostname or "").endswith(".google.com"):
+        base, p = "https://" + base, q
+host = p.hostname or ""
+if "@" in p.netloc or "\\" in p.netloc:
+    host = ""   # usuario@host o «\»: los navegadores lo interpretan distinto que Python
+claves = {k for k, _ in up.parse_qsl(p.query, keep_blank_values=True)}
+clave = None
+if host == "accounts.google.com":
+    clave = "login_hint"
+elif host == "google.com" or host.endswith(".google.com"):
+    clave = "authuser"
+if clave and clave not in claves and email:
+    base += ("&" if "?" in base else "?") + clave + "=" + up.quote(email)
+print(base + almohadilla + fragmento)
+' "$1" "$2"
+}
+
+nav_binario() { # Chromium o Chrome utilizable (el de snap no puede usar perfiles ocultos de $HOME)
+    local c p
+    if [ -n "${GCUENTAS_CHROMIUM:-}" ]; then
+        printf '%s' "$GCUENTAS_CHROMIUM"
+        return 0
+    fi
+    for c in chromium chromium-browser google-chrome-stable google-chrome; do
+        p=$(command -v "$c" 2>/dev/null) || continue
+        case $p in /snap/*) continue ;; esac
+        # En Ubuntu, /usr/bin/chromium-browser es un guion que lanza el snap.
+        if [ "$(head -c 2 "$p" 2>/dev/null)" = "#!" ] && grep -q '/snap/' "$p" 2>/dev/null; then
+            continue
+        fi
+        printf '%s' "$p"
+        return 0
+    done
+    return 1
+}
+
+nav_pid() { # pid del proceso que escucha en el puerto del navegador
+    ss -ltnpH "sport = :$GC_NAV_PUERTO" 2>/dev/null | grep -o 'pid=[0-9]*' | head -n 1 | cut -d= -f2
+}
+
+nav_vivo() { # 0 = abierto; 1 = cerrado; 2 = el puerto lo tiene otro proceso
+    local pid
+    pid=$(nav_pid)
+    [ -n "$pid" ] || return 1
+    # Chromium reescribe su línea de comandos como una sola cadena separada por espacios.
+    local cmd
+    cmd=" $(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null) "
+    [[ $cmd == *" --user-data-dir=$GC_NAV_PERFIL "* ]] && return 0
+    return 2
+}
+
+nav_arrancar() { # abre el navegador compartido si no lo está
+    local e i
+    nav_vivo
+    e=$?
+    [ $e -eq 0 ] && return 0
+    [ $e -eq 2 ] && die "el puerto $GC_NAV_PUERTO lo usa otro proceso (pid $(nav_pid)), no el navegador de gws-cuentas (cámbialo con «navegador|<perfil>|<puerto>» en $GCUENTAS_CONF)"
+    local binario
+    binario=$(nav_binario) || die "no encuentro Chromium ni Google Chrome (que no sean de snap); instala uno o define GCUENTAS_CHROMIUM"
+    preparar_cache
+    mkdir -p "$GC_NAV_PERFIL/Default" "$GC_DESCARGAS"
+    chmod 700 "$GC_NAV_PERFIL" "$GC_DESCARGAS"
+    # Descargas (p. ej. el JSON de un cliente OAuth) a una carpeta privada, sin preguntar.
+    python3 -I - "$GC_NAV_PERFIL/Default/Preferences" "$GC_DESCARGAS" <<'PY2' || true
+import json, os, sys
+ruta, descargas = sys.argv[1:]
+try:
+    datos = json.load(open(ruta))
+except Exception:
+    datos = {}
+datos.setdefault("download", {}).update(
+    {"default_directory": descargas, "prompt_for_download": False, "directory_upgrade": True})
+datos.setdefault("savefile", {})["default_directory"] = descargas
+with open(ruta, "w") as f:
+    json.dump(datos, f)
+PY2
+    setsid -f "$binario" --user-data-dir="$GC_NAV_PERFIL" "${NAV_FLAGS[@]}" \
+        --remote-debugging-port="$GC_NAV_PUERTO" --remote-debugging-address=127.0.0.1 \
+        --window-name="gws-cuentas" "$@" >>"$GC_LOG" 2>&1 </dev/null
+    for i in $(seq 1 40); do
+        nav_vivo && break
+        sleep 0.5
+    done
+    nav_vivo || die "el navegador no respondió en el puerto $GC_NAV_PUERTO (mira $GC_LOG)"
+    info "Navegador de gws-cuentas abierto (puerto $GC_NAV_PUERTO, perfil $GC_NAV_PERFIL)."
+}
+
+nav_pestana_nueva() { # abre una pestaña nueva con la URL (CDP /json/new)
+    # /json/new corta la URL en el primer «&» si no va codificada entera.
+    local cod
+    cod=$(python3 -I -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1")
+    curl -fsS -X PUT "http://127.0.0.1:$GC_NAV_PUERTO/json/new?$cod" >/dev/null 2>&1
+}
+
+
+cmd_url() {
+    local id=${1-} url=${2-}
+    requiere_cuenta "$id"
+    [ -n "$url" ] || die "falta la URL"
+    url_con_cuenta "${CUENTA_EMAIL[$id]}" "$url"
+}
+
+cmd_abrir() {
+    local id=${1-} url=${2-}
+    requiere_cuenta "$id"
+    [ -n "$url" ] || die "falta la URL"
+    url=$(url_con_cuenta "${CUENTA_EMAIL[$id]}" "$url")
+    [ -n "$url" ] || die "no pude preparar la URL"
+    nav_arrancar
+    if command -v agent-browser >/dev/null 2>&1 &&
+        timeout 90 agent-browser --session gcuenta --cdp "$GC_NAV_PUERTO" open "$url" >>"$GC_LOG" 2>&1; then
+        info "Abierto en el navegador de gws-cuentas con la cuenta «$id» (míralo con: gcuenta nav $id snapshot -i)."
+        return 0
+    fi
+    nav_pestana_nueva "$url" || die "no pude abrir la URL en el navegador"
+    info "Abierto en una pestaña nueva del navegador de gws-cuentas (cuenta «$id»)."
+}
+
+cmd_entrar() {
+    local id=${1-} email enc
+    requiere_cuenta "$id"
+    email=${CUENTA_EMAIL[$id]}
+    enc=$(python3 -I -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1]))' "$email")
+    nav_arrancar
+    nav_pestana_nueva "https://accounts.google.com/AddSession?Email=$enc&continue=https%3A%2F%2Fmyaccount.google.com%2F%3Fauthuser%3D$enc" ||
+        die "no pude abrir la pestaña de inicio de sesión"
+    info "Pestaña nueva para iniciar sesión con $email en el navegador de gws-cuentas."
+    info "Inicia sesión hasta ver tu cuenta de Google. NO cierres el navegador: las sesiones viven en él."
+}
+
+cmd_nav() {
+    local id=${1-}
+    requiere_cuenta "$id"
+    shift
+    command -v agent-browser >/dev/null 2>&1 || die "agent-browser no está instalado"
+    nav_arrancar
+    case ${1-} in
+        open | goto | navigate)
+            if [ -n "${2-}" ]; then
+                set -- "$1" "$(url_con_cuenta "${CUENTA_EMAIL[$id]}" "$2")" "${@:3}"
+            fi
+            ;;
+    esac
+    exec agent-browser --session gcuenta --cdp "$GC_NAV_PUERTO" "$@"
+}
+
+cmd_cerrar() {
+    local pid i
+    nav_vivo || { info "El navegador de gws-cuentas no está abierto."; return 0; }
+    pid=$(nav_pid)
+    kill -TERM "$pid"
+    for i in $(seq 1 20); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 1
+    done
+    kill -0 "$pid" 2>/dev/null && die "el navegador (pid $pid) sigue abierto tras 20 s; ciérralo a mano (kill -KILL $pid)"
+    info "Navegador de gws-cuentas cerrado. Google cerrará sus sesiones: para volver a usar consolas, gcuenta entrar <id>."
+    info "(Las credenciales de gws, gcloud y clasp no dependen del navegador.)"
+}
+
+# ---------------------------------------------------------------- login
+
+esperar_url() { # esperar_url <fichero> <regex> <segundos> <pid> → URL por stdout
+    local f=$1 re=$2 t=$3 pid=$4 url i=0
+    while [ $i -lt $((t * 2)) ]; do
+        url=$(grep -oE "$re" "$f" 2>/dev/null | head -n 1)
+        if [ -n "$url" ]; then
+            printf '%s' "$url"
+            return 0
+        fi
+        kill -0 "$pid" 2>/dev/null || return 1
+        sleep 0.5
+        i=$((i + 1))
+    done
+    return 1
+}
+
+esperar_fin() { # esperar_fin <pid> <segundos> → código de salida del proceso (124 si se agota)
+    local pid=$1 t=$2 i=0
+    while kill -0 "$pid" 2>/dev/null; do
+        if [ $i -ge "$t" ]; then
+            kill "$pid" 2>/dev/null
+            wait "$pid" 2>/dev/null
+            return 124
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    wait "$pid"
+}
+
+leer_scopes() { # scopes del tipo de cuenta, separados por comas
+    local f=${GCUENTAS_SCOPES_DIR:-$kit/scopes}/${CUENTA_TIPO[$1]}.txt
+    [ -r "$f" ] || die "no encuentro la lista de scopes $f"
+    grep -vE '^[[:space:]]*(#|$)' "$f" | tr -d '[:blank:]' | paste -sd, -
+}
+
+# Staging y pid del login en curso: globales, para que el trap de salida los vea.
+LOGIN_ETAPA=""
+LOGIN_PID=""
+limpiar_login() {
+    [ -n "$LOGIN_PID" ] && kill "$LOGIN_PID" 2>/dev/null
+    [ -n "$LOGIN_ETAPA" ] && rm -rf "$LOGIN_ETAPA"
+    LOGIN_PID="" LOGIN_ETAPA=""
+}
+
+login_gws() {
+    local id=$1 email scopes url codigo cuenta
+    email=${CUENTA_EMAIL[$id]}
+    [ -s "$GC_GWS_DIR/client_secret.json" ] ||
+        die "falta $GC_GWS_DIR/client_secret.json (cliente OAuth Desktop «gws-${GCUENTAS_MAQUINA:-<maquina>}» del proyecto de la cuenta)"
+    [ -x "$GC_GWS_BIN" ] || die "no encuentro gws en $GC_GWS_BIN"
+    scopes=$(leer_scopes "$id") || exit 1
+    [ -n "$scopes" ] || die "la lista de scopes de «${CUENTA_TIPO[$id]}» está vacía"
+    preparar_cache
+    # gws escribe credentials.enc ANTES de saber con qué cuenta se ha entrado. Por eso el
+    # login se hace en un directorio de staging y solo se copia si el email coincide.
+    LOGIN_ETAPA=$(mktemp -d "$GCUENTAS_CACHE/login-gws-$id.XXXXXX") || die "no puedo crear el staging"
+    local etapa=$LOGIN_ETAPA
+    chmod 700 "$etapa"
+    trap limpiar_login EXIT
+    install -m 600 "$GC_GWS_DIR/client_secret.json" "$etapa/client_secret.json"
+    : >"$etapa/.env"   # gws solo carga el primer .env: este, vacío, tapa cualquiera de más arriba
+    (
+        cd "$etapa" || exit 1
+        unset GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE GOOGLE_APPLICATION_CREDENTIALS \
+            GOOGLE_WORKSPACE_CLI_CLIENT_ID GOOGLE_WORKSPACE_CLI_CLIENT_SECRET \
+            HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
+        export GOOGLE_WORKSPACE_CLI_CONFIG_DIR=$etapa GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND=file \
+            GOOGLE_WORKSPACE_CLI_TOKEN=
+        exec "$GC_GWS_BIN" auth login --scopes "$scopes"
+    ) >"$etapa/salida.json" 2>"$etapa/errores.log" &
+    LOGIN_PID=$!
+    url=$(esperar_url "$etapa/errores.log" 'https://accounts\.google\.com/o/oauth2/[^[:space:]]+' 60 "$LOGIN_PID") || {
+        cat "$etapa/errores.log" >&2
+        die "gws no mostró la URL de consentimiento"
+    }
+    cmd_abrir "$id" "$url"
+    info "Esperando el consentimiento de ${email} (máx. 10 min)…"
+    esperar_fin "$LOGIN_PID" 600
+    codigo=$?
+    if [ $codigo -ne 0 ]; then
+        sed -n '1,20p' "$etapa/errores.log" >&2
+        die "el login de gws terminó con código $codigo; no he tocado las credenciales de «$id»"
+    fi
+    cuenta=$(json_campo account <"$etapa/salida.json")
+    if [ -z "$cuenta" ] || [ "$cuenta" = "(unknown)" ]; then
+        cuenta=$(cd "$etapa" && (
+            unset GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE GOOGLE_APPLICATION_CREDENTIALS \
+                GOOGLE_WORKSPACE_CLI_CLIENT_ID GOOGLE_WORKSPACE_CLI_CLIENT_SECRET
+            export GOOGLE_WORKSPACE_CLI_CONFIG_DIR=$etapa GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND=file \
+                GOOGLE_WORKSPACE_CLI_TOKEN=
+            "$GC_GWS_BIN" auth status
+        ) 2>/dev/null | json_campo user)
+    fi
+    if [ "$(minusculas "$cuenta")" != "$(minusculas "$email")" ]; then
+        die "el consentimiento se hizo con «${cuenta:-desconocida}», no con «$email»; no he tocado las credenciales de «$id»"
+    fi
+    [ -s "$etapa/credentials.enc" ] || die "gws no dejó credentials.enc en el staging"
+    local f
+    for f in credentials.enc .encryption_key; do
+        [ -e "$etapa/$f" ] && install -m 600 "$etapa/$f" "$GC_GWS_DIR/$f.nuevo"
+    done
+    for f in credentials.enc .encryption_key; do
+        [ -e "$GC_GWS_DIR/$f.nuevo" ] && mv -f "$GC_GWS_DIR/$f.nuevo" "$GC_GWS_DIR/$f"
+    done
+    # La caché de token no distingue cuentas ni scopes nuevos: se tira siempre.
+    rm -f "$GC_GWS_DIR/token_cache.json" "$GC_GWS_DIR/credentials.json"
+    info "gws de «$id» listo con $email."
+}
+
+login_gcloud() {
+    local id=$1 email proy cuenta
+    email=${CUENTA_EMAIL[$id]}
+    proy=${CUENTA_PROYECTO[$id]:-}
+    [ -x "$GC_GCLOUD_BIN_DIR/gcloud" ] || die "no encuentro gcloud en $GC_GCLOUD_BIN_DIR"
+    mkdir -p "$GC_GCLOUD_DIR" && chmod 700 "$GC_GCLOUD_DIR"
+    preparar_cache
+    # «gcloud auth login <email>» rechaza otra cuenta antes de guardar nada. El navegador lo
+    # abre gcuenta-abrir (BROWSER), que manda la URL al perfil de esta cuenta y sale ya:
+    # el BROWSER de Crostini (garcon) la abriría en el Chrome de ChromeOS.
+    (
+        cd "$HOME" || exit 1
+        cuentas_entorno_gcloud
+        export GCUENTA=$id BROWSER=$kit/bin/gcuenta-abrir
+        "$GC_GCLOUD_BIN_DIR/gcloud" auth login "$email" --brief </dev/null
+    ) || die "el login de gcloud para «$id» no se completó"
+    (
+        cd "$HOME" || exit 1
+        cuentas_entorno_gcloud
+        "$GC_GCLOUD_BIN_DIR/gcloud" config set survey/disable_prompts True --quiet >/dev/null 2>&1
+        if [ -n "$proy" ]; then
+            "$GC_GCLOUD_BIN_DIR/gcloud" config set project "$proy" --quiet >/dev/null 2>&1
+        fi
+    )
+    cuenta=$(cd "$HOME" && cuentas_entorno_gcloud && "$GC_GCLOUD_BIN_DIR/gcloud" auth list \
+        --filter=status:ACTIVE --format='value(account)' 2>/dev/null)
+    [ "$(minusculas "$cuenta")" = "$(minusculas "$email")" ] ||
+        die "gcloud quedó con «${cuenta:-ninguna}» como cuenta activa, no con «$email»"
+    info "gcloud de «$id» listo con $email${proy:+ (proyecto $proy)}."
+}
+
+login_clasp() {
+    local id=$1 email url codigo correo
+    email=${CUENTA_EMAIL[$id]}
+    [ -s "$GC_GWS_DIR/client_secret.json" ] ||
+        die "clasp usa el cliente de gws de la cuenta y falta $GC_GWS_DIR/client_secret.json"
+    [ -x "$GC_CLASP_BIN" ] || die "no encuentro clasp en $GC_CLASP_BIN"
+    preparar_cache
+    mkdir -p "$GC_CLASP_DIR" && chmod 700 "$GC_CLASP_DIR"
+    LOGIN_ETAPA=$(mktemp -d "$GCUENTAS_CACHE/login-clasp-$id.XXXXXX") || die "no puedo crear el staging"
+    local etapa=$LOGIN_ETAPA
+    chmod 700 "$etapa"
+    trap limpiar_login EXIT
+    # clasp exige un redirect a localhost en el cliente; se lo añadimos a una copia.
+    python3 -I - "$GC_GWS_DIR/client_secret.json" "$etapa/cliente.json" <<'PY' || die "client_secret.json no es válido"
+import json, os, sys
+datos = json.load(open(sys.argv[1]))
+clave = "installed" if "installed" in datos else "web"
+uris = datos[clave].setdefault("redirect_uris", [])
+if not any(u.startswith("http://localhost") for u in uris):
+    uris.append("http://localhost")
+with open(sys.argv[2], "w") as f:
+    json.dump(datos, f)
+os.chmod(sys.argv[2], 0o600)
+PY
+    # Sin DISPLAY, xdg-open no manda la URL al Chromium por defecto: la leemos de la salida
+    # de clasp y la abrimos en el perfil de la cuenta.
+    (
+        cd "$etapa" || exit 1
+        unset DISPLAY WAYLAND_DISPLAY
+        export BROWSER=/bin/true clasp_config_auth=$etapa/.clasprc.json
+        exec "$GC_CLASP_BIN" login --creds "$etapa/cliente.json"
+    ) >"$etapa/salida.log" 2>&1 </dev/null &
+    LOGIN_PID=$!
+    url=$(esperar_url "$etapa/salida.log" 'https://accounts\.google\.com/[^[:space:]`"]+' 60 "$LOGIN_PID") || {
+        cat "$etapa/salida.log" >&2
+        die "clasp no mostró la URL de consentimiento"
+    }
+    cmd_abrir "$id" "$url"
+    info "Esperando el consentimiento de ${email} para clasp (máx. 10 min)…"
+    esperar_fin "$LOGIN_PID" 600
+    codigo=$?
+    [ $codigo -eq 0 ] || {
+        sed -n '1,20p' "$etapa/salida.log" >&2
+        die "el login de clasp terminó con código $codigo"
+    }
+    correo=$(cd "$etapa" && clasp_config_auth=$etapa/.clasprc.json "$GC_CLASP_BIN" --json show-authorized-user \
+        2>/dev/null | json_campo email)
+    [ "$(minusculas "$correo")" = "$(minusculas "$email")" ] ||
+        die "clasp entró con «${correo:-desconocida}», no con «$email»; no he tocado el login de «$id»"
+    install -m 600 "$etapa/.clasprc.json" "$GC_CLASP_AUTH.nuevo" && mv -f "$GC_CLASP_AUTH.nuevo" "$GC_CLASP_AUTH"
+    info "clasp de «$id» listo con $email."
+}
+
+cmd_login() {
+    local id=${1-} herramienta=${2-}
+    requiere_cuenta "$id"
+    case $herramienta in
+        gws) login_gws "$id" ;;
+        gcloud) login_gcloud "$id" ;;
+        clasp) login_clasp "$id" ;;
+        *) die "uso: gcuenta login <id> <gws|gcloud|clasp>" ;;
+    esac
+    LOGIN_PID=""
+    limpiar_login
+    trap - EXIT
+    info ""
+    estado_cuenta "$id" >&2 || true
+}
+
+# ---------------------------------------------------------------- hook de Claude Code
+
+cmd_hook() {
+    # Nunca falla ni tarda: la primera respuesta de Claude espera a este hook.
+    local entrada="" cwd=""
+    if [ ! -t 0 ]; then
+        entrada=$(timeout 2 cat 2>/dev/null) || true
+    fi
+    cwd=$(printf '%s' "$entrada" | json_campo cwd)
+    [ -n "$cwd" ] || cwd=$PWD
+    local otras="" i
+    for i in "${CUENTAS_IDS[@]}"; do otras+="${otras:+, }$i=${CUENTA_EMAIL[$i]}"; done
+    if [ -n "${GCUENTA:-}" ]; then
+        # El shim obedece a GCUENTA: el hook tiene que decir lo mismo.
+        if ! cuentas_resolver 2>/dev/null; then
+            printf '[gws-cuentas] ⚠️ GCUENTA=«%s» está exportada y no es una cuenta configurada: gws, gcloud y clasp fallarán hasta quitarla (unset GCUENTA).\n' "$GCUENTA"
+            return 0
+        fi
+        GC_MOTIVO="GCUENTA=$GC_ID exportada en la sesión (manda sobre la carpeta)"
+    else
+        cuentas_resolver "$cwd" || {
+            printf '[gws-cuentas] ⚠️ No pude resolver la cuenta Google de esta carpeta.\n'
+            return 0
+        }
+    fi
+    python3 -I - "$GCUENTAS_CACHE/estado-$GC_ID.json" "$GC_ID" "${CUENTA_EMAIL[$GC_ID]}" \
+        "${CUENTA_PROYECTO[$GC_ID]:-}" "$GC_MOTIVO" "$otras" "$GCUENTAS_CONECTORES" \
+        "${CUENTA_EMAIL[${GCUENTAS_CONECTORES:-_}]:-}" <<'PY' 2>/dev/null ||
+import json, sys, time
+cache, id_, email, proy, motivo, otras, con_id, con_email = sys.argv[1:]
+lineas = [
+    f"[gws-cuentas] En esta carpeta, gws, gcloud, gsutil, bq y clasp trabajan con la cuenta Google "
+    f"«{id_}» = {email}" + (f" (proyecto GCP {proy})" if proy else "") + f". Motivo: {motivo}.",
+    "- No hace falta login: el shim de ~/.local/bin elige la cuenta en cada llamada según la carpeta "
+    "(pwd -P). «gws auth login», «gcloud auth login» y «clasp login» están bloqueados; los logins se "
+    "hacen con «gcuenta login <id> <gws|gcloud|clasp>» y necesitan al usuario delante.",
+    f"- Para un comando suelto con otra cuenta: GCUENTA=<id> gws …  (cuentas: {otras}).",
+]
+try:
+    d = json.load(open(cache))
+    if "email" in d and str(d["email"]).lower() != email.lower():
+        raise ValueError("caché de otra cuenta")
+    horas = (time.time() - d.get("fecha", 0)) / 3600
+    edad = f"hace {horas:.0f} h" if horas >= 1 else "hace menos de 1 h"
+    partes, mal = [], []
+    for h in ("gws", "gcloud", "clasp"):
+        e = d.get(h, {})
+        partes.append(f"{h} {'OK' if e.get('ok') else '✗'}" + (f" ({e.get('scopes')} scopes)" if h == "gws" and e.get("ok") else ""))
+        if not e.get("ok"):
+            mal.append(f"{h}: {e.get('detalle', '?')}")
+    linea = f"- Último estado comprobado ({edad}): " + " · ".join(partes) + "."
+    if mal:
+        linea += " ⚠️ " + "; ".join(mal) + ". Antes de depender de esa herramienta, ejecuta «gcuenta estado»."
+    elif horas > 24 * 7:
+        linea += " Comprobación antigua: ejecuta «gcuenta estado» si algo falla."
+    lineas.append(linea)
+except Exception:
+    lineas.append("- Sin estado comprobado todavía: ejecuta «gcuenta estado» antes de depender de gws/gcloud/clasp.")
+if con_email:
+    if con_id == id_:
+        lineas.append(f"- Los conectores de claude.ai (Gmail, Drive, Calendar) están ligados a {con_email}, la misma cuenta que esta carpeta.")
+    else:
+        lineas.append(f"- Los conectores de claude.ai (Gmail, Drive, Calendar) están ligados a {con_email} y NO siguen esta regla: para datos de {email} usa gws, no esos conectores.")
+lineas.append("- Consolas de Google (Cloud, Admin, Apps Script): «gcuenta nav <id> open <url>» usa el navegador compartido con la sesión de cada cuenta. No lances agent-browser a secas para Google.")
+lineas.append("- Detalles del protocolo: skill «google-cuentas».")
+print("\n".join(lineas))
+PY
+        printf '[gws-cuentas] Cuenta Google de esta carpeta: %s = %s.\n' "$GC_ID" "${CUENTA_EMAIL[$GC_ID]}"
+    return 0
+}
+
+# ---------------------------------------------------------------- doctor
+
+cmd_doctor() {
+    local bien=0 mal=0 aviso=0 id i h destino
+    ok() { printf '  ✓ %s\n' "$*"; bien=$((bien + 1)); }
+    ko() { printf '  ✗ %s\n' "$*"; mal=$((mal + 1)); }
+    av() { printf '  ⚠ %s\n' "$*"; aviso=$((aviso + 1)); }
+    printf 'Configuración: %s\n' "$GCUENTAS_CONF"
+    ok "${#CUENTAS_IDS[@]} cuentas, ${#RUTAS_PREFIJO[@]} reglas, defecto «$CUENTA_DEFECTO»"
+    for i in "${!RUTAS_PREFIJO[@]}"; do
+        if [ -d "${RUTAS_PREFIJO[$i]}" ]; then
+            ok "regla ${RUTAS_PREFIJO[$i]} → ${RUTAS_ID[$i]}"
+        else
+            av "la carpeta de la regla no existe (¿tilde en otra normalización?): ${RUTAS_PREFIJO[$i]}"
+        fi
+    done
+    printf 'Shims:\n'
+    for h in gws gcloud gsutil bq clasp; do
+        destino=$(command -v "$h" 2>/dev/null)
+        if [ -n "$destino" ] && [ "$(readlink -f "$destino")" = "$kit/bin/cuenta-shim" ]; then
+            ok "$h → cuenta-shim"
+        else
+            ko "$h no pasa por el shim (resuelve a «${destino:-nada}»)"
+        fi
+    done
+    [ -x "$GC_GWS_BIN" ] && ok "gws real: $GC_GWS_BIN" || ko "falta gws real en $GC_GWS_BIN"
+    [ -x "$GC_GCLOUD_BIN_DIR/gcloud" ] && ok "gcloud real: $GC_GCLOUD_BIN_DIR/gcloud" || ko "falta gcloud real"
+    [ -x "$GC_CLASP_BIN" ] && ok "clasp real: $GC_CLASP_BIN" || ko "falta clasp real en $GC_CLASP_BIN"
+    command -v agent-browser >/dev/null 2>&1 && ok "agent-browser: $(command -v agent-browser)" || av "agent-browser no está instalado"
+    printf 'Cepos (rutas por defecto que no deben usarse):\n'
+    for h in "$HOME/.config/gws" "$HOME/.config/gcloud"; do
+        if [ -f "$h" ] && [ ! -s "$h" ] && [ "$(stat -c %a "$h")" = 0 ]; then
+            ok "$h es un fichero vacío con modo 000"
+        else
+            ko "$h no es el cepo (fichero vacío, modo 000)"
+        fi
+    done
+    for id in "${CUENTAS_IDS[@]}"; do
+        cuentas_dirs "$id"
+        printf 'Cuenta %s (%s):\n' "$id" "${CUENTA_EMAIL[$id]}"
+        for h in "$GC_GWS_DIR" "$GC_GCLOUD_DIR" "$GC_CLASP_DIR"; do
+            if [ -d "$h" ] && [ "$(stat -c %a "$h")" = 700 ]; then ok "$h (700)"; else ko "$h falta o no es 700"; fi
+        done
+        if [ -f "$GC_GWS_DIR/client_secret.json" ]; then
+            [ "$(stat -c %a "$GC_GWS_DIR/client_secret.json")" = 600 ] && ok "client_secret.json (600)" ||
+                ko "client_secret.json no es 600"
+        else
+            av "sin client_secret.json todavía"
+        fi
+        [ -s "$GC_GWS_DIR/credentials.enc" ] && ok "gws con credenciales" || av "gws sin login"
+    done
+    printf 'Navegador compartido:\n'
+    [ -d "$GC_NAV_PERFIL" ] && ok "perfil $GC_NAV_PERFIL" || av "el perfil $GC_NAV_PERFIL aún no existe (gcuenta entrar <id>)"
+    nav_vivo
+    case $? in
+        0) ok "abierto en 127.0.0.1:$GC_NAV_PUERTO" ;;
+        1) av "cerrado (se abre al usarlo; si Google pide sesión: gcuenta entrar <id>)" ;;
+        2) ko "el puerto $GC_NAV_PUERTO lo usa otro proceso" ;;
+    esac
+    printf 'Claude Code:\n'
+    if grep -q 'gcuenta hook' "$HOME/.claude/settings.json" 2>/dev/null; then ok "hook SessionStart"; else ko "falta el hook en ~/.claude/settings.json"; fi
+    [ -f "$HOME/.claude/skills/google-cuentas/SKILL.md" ] && ok "skill google-cuentas" || ko "falta la skill google-cuentas"
+    printf '\n%d bien, %d avisos, %d errores\n' "$bien" "$aviso" "$mal"
+    [ $mal -eq 0 ]
+}
+
+# ---------------------------------------------------------------- main
+# Todo dentro de main(), y «main "$@"; exit $?» en UNA línea: bash lee el script por partes,
+# pero esa línea ya la tiene entera antes de ejecutarla y no vuelve a leer del fichero al
+# acabar main. Así, editar el fichero mientras corre un login no rompe ese login.
+main() {
+    local orden=${1:-cual}
+    case $orden in -h | --help | ayuda | help) uso; return 0 ;; esac
+
+    if ! cuentas_cargar; then
+        # El hook nunca debe romper el arranque de Claude.
+        if [ "$orden" = hook ]; then
+            printf '[gws-cuentas] ⚠️ La configuración de cuentas no se puede leer (%s).\n' "$GCUENTAS_CONF"
+            return 0
+        fi
+        return 2
+    fi
+
+    [ $# -gt 0 ] && shift
+    case $orden in
+        cual) cmd_cual "$@" ;;
+        id) cmd_id "$@" ;;
+        lista) cmd_lista ;;
+        env) cmd_env "$@" ;;
+        estado) cmd_estado "$@" ;;
+        login) cmd_login "$@" ;;
+        abrir) cmd_abrir "$@" ;;
+        entrar) cmd_entrar "$@" ;;
+        url) cmd_url "$@" ;;
+        cerrar) cmd_cerrar ;;
+        nav) cmd_nav "$@" ;;
+        hook) cmd_hook ;;
+        doctor) cmd_doctor ;;
+        *)
+            uso >&2
+            return 2
+            ;;
+    esac
+}
+
+main "$@"; exit $?

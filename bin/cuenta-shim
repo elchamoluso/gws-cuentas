@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# cuenta-shim — punto de entrada único de gws, gcloud, gsutil, bq y clasp.
+#
+# Se instala como symlinks en ~/.local/bin (delante en el PATH) con el nombre de cada
+# herramienta. En cada llamada elige la cuenta Google (GCUENTA si está definida; si no,
+# la carpeta actual; si no, la cuenta por defecto), prepara el entorno de esa cuenta y
+# ejecuta la herramienta real por ruta absoluta.
+#
+# Nunca escribe en stdout: la salida de la herramienta llega intacta (JSON incluido).
+# Los logins no pasan por aquí: se hacen con «gcuenta login <id> <herramienta>», que
+# comprueba el email antes de guardar nada.
+set -u
+
+herramienta=${0##*/}
+argumentos="$*"
+kit=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+# shellcheck source=../lib/cuentas.sh
+. "$kit/lib/cuentas.sh"
+
+cuentas_cargar || exit 2
+cuentas_resolver || exit 2
+id=$GC_ID
+cuentas_dirs "$id"
+export GCUENTA=$id
+[ "${GCUENTAS_VERBOSE:-}" = 1 ] && _gc_err "$herramienta → $id (${CUENTA_EMAIL[$id]}; $GC_MOTIVO)"
+
+bloquear() {
+    _gc_err "«$herramienta $argumentos» está bloqueado: $1"
+    exit 3
+}
+
+# Argumentos que no son flags. Se salta el valor de las opciones globales que lo llevan
+# separado («--account x», «-u x»), para que «gcloud --account x auth login» o
+# «clasp -u x login» no escondan el subcomando.
+case $herramienta in
+    gcloud | gsutil | bq)
+        con_valor=" --project --account --configuration --verbosity --billing-project --impersonate-service-account --format --flags-file --trace-token --access-token-file " ;;
+    clasp) con_valor=" -u --user -A --auth -P --project -I --ignore " ;;
+    *) con_valor=" " ;;
+esac
+posicionales=()
+saltar=0
+for arg in "$@"; do
+    if [ $saltar = 1 ]; then
+        saltar=0
+        continue
+    fi
+    case $arg in
+        -*) case $con_valor in *" $arg "*) saltar=1 ;; esac ;;
+        *) posicionales+=("$arg") ;;
+    esac
+done
+
+# tiene <p1> <p2>… → ¿aparecen esas palabras seguidas entre los posicionales?
+# Se comparan elemento a elemento: un texto libre con «auth login» dentro no cuenta.
+tiene() {
+    local i j n=$# total=${#posicionales[@]}
+    local -a buscado=("$@")
+    for ((i = 0; i + n <= total; i++)); do
+        for ((j = 0; j < n; j++)); do
+            [ "${posicionales[i + j]}" = "${buscado[j]}" ] || continue 2
+        done
+        return 0
+    done
+    return 1
+}
+
+case $herramienta in
+    gws)
+        if tiene auth login || tiene auth logout || tiene auth setup; then
+            bloquear "usa «gcuenta login $id gws» (comprueba la cuenta antes de guardar las credenciales)"
+        fi
+        if tiene auth export; then
+            for arg in "$@"; do
+                [ "$arg" = "--unmasked" ] && bloquear "imprimiría el refresh token de $id en claro"
+            done
+        fi
+        # gws carga el primer .env que encuentra subiendo desde la carpeta (dotenvy). Si ese
+        # .env define variables GOOGLE_* o de proxy, podría cambiar de cuenta o de cliente.
+        d=$(pwd -P 2>/dev/null) || d=/
+        while :; do
+            if [ -f "$d/.env" ]; then
+                if grep -qiE '^[[:space:]]*(export[[:space:]]+)?(GOOGLE_[A-Z0-9_]*|[A-Z0-9_]*_PROXY)[[:space:]]*=' "$d/.env" 2>/dev/null; then
+                    bloquear "$d/.env define variables GOOGLE_* o *_PROXY que gws cargaría y podrían cambiar de cuenta; quítalas de ahí"
+                fi
+                break
+            fi
+            [ "$d" = / ] && break
+            d=${d%/*}
+            [ -z "$d" ] && d=/
+        done
+        [ -d "$GC_GWS_DIR" ] || { _gc_err "la cuenta $id no tiene espacio gws ($GC_GWS_DIR); ejecuta install.sh"; exit 2; }
+        [ -x "$GC_GWS_BIN" ] || { _gc_err "no encuentro gws en $GC_GWS_BIN"; exit 2; }
+        cuentas_entorno_gws "$id"
+        exec "$GC_GWS_BIN" "$@"
+        ;;
+
+    gcloud | gsutil | bq)
+        if [ "$herramienta" = gcloud ]; then
+            if tiene auth login || tiene auth revoke || tiene auth application-default login ||
+                tiene auth application-default revoke || tiene config set account ||
+                tiene config set core/account; then
+                bloquear "usa «gcuenta login $id gcloud» (cada cuenta tiene su propio espacio de gcloud)"
+            fi
+            [ "${posicionales[0]-}" = init ] && bloquear "el «gcloud init» de cada cuenta es «gcuenta login $id gcloud»"
+            tiene auth print-refresh-token && bloquear "imprimiría el refresh token de $id en claro"
+        fi
+        real=$GC_GCLOUD_BIN_DIR/$herramienta
+        [ -x "$real" ] || { _gc_err "no encuentro $herramienta en $real"; exit 2; }
+        mkdir -p -m 700 "$GC_GCLOUD_DIR" 2>/dev/null
+        cuentas_entorno_gcloud
+        exec "$real" "$@"
+        ;;
+
+    clasp)
+        case ${posicionales[0]-} in
+            login | logout) bloquear "usa «gcuenta login $id clasp»" ;;
+        esac
+        [ -x "$GC_CLASP_BIN" ] || { _gc_err "no encuentro clasp en $GC_CLASP_BIN"; exit 2; }
+        cuentas_entorno_clasp
+        exec "$GC_CLASP_BIN" "$@"
+        ;;
+
+    *)
+        _gc_err "cuenta-shim no sabe manejar «$herramienta» (enlázalo como gws, gcloud, gsutil, bq o clasp)"
+        exit 2
+        ;;
+esac

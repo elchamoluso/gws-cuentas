@@ -1,0 +1,7 @@
+# La configuración real de cada máquina y cualquier credencial se quedan fuera.
+cuentas.conf
+client_secret*.json
+credentials*.json
+*.enc
+.encryption_key
+.clasprc.json

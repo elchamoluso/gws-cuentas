@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# gcuenta-abrir — BROWSER para los logins de gcloud.
+#
+# gcloud llama a $BROWSER con la URL y espera a que termine. Aquí la mandamos al navegador
+# de la cuenta GCUENTA (en segundo plano) y salimos enseguida. El BROWSER que trae Crostini
+# (garcon-url-handler) la abriría en el Chrome de ChromeOS, con otra sesión de Google.
+url=${1:?falta la URL}
+: "${GCUENTA:?gcuenta-abrir necesita GCUENTA}"
+kit=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+cache=${GCUENTAS_CACHE:-$HOME/.cache/gws-cuentas}
+mkdir -p "$cache" && chmod 700 "$cache"
+setsid -f "$kit/bin/gcuenta" abrir "$GCUENTA" "$url" >>"$cache/gcuenta.log" 2>&1 </dev/null
+exit 0

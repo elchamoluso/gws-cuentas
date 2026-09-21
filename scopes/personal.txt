@@ -1,0 +1,23 @@
+# Scopes para cuentas personales @gmail.com (app Externa). Máximo 25 en total contando
+# los 3 que gws añade (openid, userinfo.email, userinfo.profile): aquí van 20.
+# Sin Chat ni Admin (no existen para cuentas personales).
+https://www.googleapis.com/auth/drive
+https://www.googleapis.com/auth/spreadsheets
+https://www.googleapis.com/auth/documents
+https://www.googleapis.com/auth/presentations
+https://mail.google.com/
+https://www.googleapis.com/auth/calendar
+https://www.googleapis.com/auth/tasks
+https://www.googleapis.com/auth/contacts
+https://www.googleapis.com/auth/forms.body
+https://www.googleapis.com/auth/forms.responses.readonly
+https://www.googleapis.com/auth/meetings.space.created
+https://www.googleapis.com/auth/classroom.courses
+https://www.googleapis.com/auth/classroom.rosters
+https://www.googleapis.com/auth/classroom.coursework.me
+https://www.googleapis.com/auth/classroom.coursework.students
+https://www.googleapis.com/auth/classroom.courseworkmaterials
+https://www.googleapis.com/auth/classroom.announcements
+https://www.googleapis.com/auth/classroom.topics
+https://www.googleapis.com/auth/script.projects
+https://www.googleapis.com/auth/script.deployments
