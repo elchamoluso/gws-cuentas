@@ -75,6 +75,24 @@ case $herramienta in
                 [ "$arg" = "--unmasked" ] && bloquear "imprimiría el refresh token de $id en claro"
             done
         fi
+        # Los agentes no envían correo (regla del Cerebro): solo dejan borradores. Desde tu Terminal sí pasa.
+        envia=""
+        if tiene gmail +send || tiene gmail +reply || tiene gmail +reply-all || tiene gmail +forward; then
+            envia=atajo
+        elif tiene gmail users messages send || tiene gmail users drafts send; then
+            envia=api
+        fi
+        for arg in "$@"; do
+            case $arg in
+                --dry-run) envia="" ;;
+                --draft) [ "$envia" = atajo ] && envia="" ;;
+            esac
+        done
+        if [ -n "$envia" ] && agente=$(cuentas_agente); then
+            [ "$envia" = atajo ] &&
+                bloquear "los agentes no envían correo ($agente): añade --draft y queda en borrador; lo envía Jesús a mano"
+            bloquear "los agentes no envían correo ($agente): deja un borrador (gws gmail +send … --draft o gws gmail users drafts create); lo envía Jesús a mano"
+        fi
         # gws carga el primer .env que encuentra subiendo desde la carpeta (dotenvy). Si ese
         # .env define variables GOOGLE_* o de proxy, podría cambiar de cuenta o de cliente.
         d=$(pwd -P 2>/dev/null) || d=/

@@ -50,6 +50,30 @@ contiene "…y remite a gcuenta login" "gcuenta login personal gws" "$(cd "$FORM
 contiene "gws auth export (enmascarado) sí pasa" "a1=auth" "$(cd "$FORM" && "$B/gws" auth export 2>/dev/null)"
 contiene "gws auth status sí pasa" "a1=auth" "$(cd "$FORM" && "$B/gws" auth status 2>/dev/null)"
 
+echo "Correo: los agentes solo dejan borradores:"
+for marca in CLAUDECODE=1 CODEX_THREAD_ID=x ANTIGRAVITY_AGENT=1; do
+    esperar "con $marca, gmail +send sin --draft: bloqueado" "3:" \
+        "$(cd "$FORM" && env "$marca" "$B/gws" gmail +send --to a@b.c --subject s --body b 2>/dev/null; echo "$?:")"
+done
+for args in "gmail +reply --message-id 1 --body b" "gmail +reply-all --message-id 1 --body b" \
+    "gmail +forward --message-id 1 --to a@b.c" "gmail users messages send --json {}" \
+    "gmail users drafts send --json {}" "gmail users drafts send --draft" "--format json gmail +send --to a@b.c"; do
+    # shellcheck disable=SC2086
+    esperar "agente: gws $args bloqueado" "3:" "$(cd "$FORM" && CLAUDECODE=1 "$B/gws" $args 2>/dev/null; echo "$?:")"
+done
+contiene "…y dice cómo dejarlo en borrador" "añade --draft" "$(cd "$FORM" && CLAUDECODE=1 "$B/gws" gmail +send --to a@b.c 2>&1)"
+contiene "agente: +send --draft pasa" "a1=gmail" \
+    "$(cd "$FORM" && CLAUDECODE=1 "$B/gws" gmail +send --to a@b.c --subject s --body b --draft 2>/dev/null)"
+contiene "agente: users drafts create pasa" "a1=gmail" "$(cd "$FORM" && CLAUDECODE=1 "$B/gws" gmail users drafts create --json {} 2>/dev/null)"
+contiene "agente: --dry-run pasa" "a1=gmail" "$(cd "$FORM" && CLAUDECODE=1 "$B/gws" gmail users messages send --dry-run 2>/dev/null)"
+contiene "agente: leer correo pasa" "a1=gmail" "$(cd "$FORM" && CLAUDECODE=1 "$B/gws" gmail +triage 2>/dev/null)"
+contiene "sin agente (tu Terminal): +send pasa" "a1=gmail" "$(cd "$FORM" && "$B/gws" gmail +send --to a@b.c --subject s --body b 2>/dev/null)"
+# Sin variables, por la cadena de procesos: un «claude» de mentira lanza gws.
+printf '#!/usr/bin/env bash\n"$@"\n' >"$T/bin/claude"
+chmod 755 "$T/bin/claude"
+esperar "sin variables, por la cadena de procesos: bloqueado" "3:" \
+    "$(cd "$FORM" && GCUENTAS_PROC=/proc "$T/bin/claude" "$B/gws" gmail +send --to a@b.c 2>/dev/null; echo "$?:")"
+
 echo "Cepo de .env:"
 printf 'FOO=1\n# GOOGLE_X=1 comentado\n' >"$FORM/.env"
 contiene ".env inocuo: pasa" "a1=x" "$(cd "$FORM/01-sub" && "$B/gws" x 2>/dev/null)"

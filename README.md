@@ -47,7 +47,12 @@ de dos cuentas a N, añade gcloud y clasp, y hace que la elección sea automáti
    También **bloquea**:
    - los logins directos (`gws auth login`, `gcloud auth login`, `gcloud init`, `clasp login`…);
    - `gws auth export --unmasked`;
-   - `.env` con variables `GOOGLE_*` o de proxy.
+   - `.env` con variables `GOOGLE_*` o de proxy;
+   - los envíos de correo cuando los lanza un agente (Claude Code, Codex o agy): `gmail +send`,
+     `+reply`, `+reply-all` y `+forward` sin `--draft`, y `gmail users messages send` o
+     `users drafts send`. Con `--draft` o `--dry-run` pasan, y desde tu Terminal también.
+     Al agente lo reconoce por las variables que pone en sus comandos (`CLAUDECODE`,
+     `CODEX_THREAD_ID`, `ANTIGRAVITY_AGENT`) o, si no están, por la cadena de procesos.
 3. **Cepos.** `~/.config/gws` y `~/.config/gcloud` son ficheros vacíos con modo 000. Si algo
    se salta el shim, falla a la vista en vez de usar otra cuenta en silencio.
 4. **`gcuenta`**, la herramienta del protocolo:

@@ -27,6 +27,9 @@ que iniciar sesión ni cambiar de cuenta.
 4. **Antes de escribir** (enviar correo, compartir, borrar, crear eventos, tocar Admin),
    confirma que la cuenta que muestra `gcuenta` es la que el usuario quiere. Usa `--dry-run`
    cuando gws lo ofrezca.
+   **El correo, siempre en borrador:** `gws gmail +send … --draft` (o `+reply`/`+forward` con
+   `--draft`, o `gmail users drafts create`). El shim no deja a un agente enviar correo: sin
+   `--draft` sale «bloqueado» (código 3). No busques otra forma: el envío lo hace el usuario.
 5. **Los conectores de claude.ai** (Gmail, Drive, Calendar) están ligados a **una sola**
    cuenta (línea `conectores|` de la configuración; el hook la nombra). No siguen las reglas
    de carpeta. Para datos de cualquier otra cuenta, usa gws.

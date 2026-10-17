@@ -8,6 +8,10 @@ T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
 export HOME=$T/home GCUENTAS_CONF=$T/cuentas.conf GCUENTAS_CACHE=$T/cache
 unset GCUENTA GCUENTAS_VERBOSE
+# Los tests no saben si los lanza un agente: sin sus variables y con una cadena de procesos vacía.
+unset CLAUDECODE CODEX_THREAD_ID ANTIGRAVITY_AGENT
+mkdir -p "$T/proc-vacio"
+export GCUENTAS_PROC=$T/proc-vacio
 D=$T/mnt/shared/GoogleDrive
 FORM=$D/SharedDrives/Formación
 ASOC="$D/SharedDrives/Asociación Local"

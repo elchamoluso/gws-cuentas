@@ -29,6 +29,28 @@ GC_NAV_PUERTO=""
 
 _gc_err() { printf 'gcuenta: %s\n' "$*" >&2; }
 
+# cuentas_agente → si la llamada viene de un agente (Claude Code, Codex o agy), escribe su nombre y
+# devuelve 0. Mira las variables que cada uno pone en sus comandos (CLAUDECODE, CODEX_THREAD_ID,
+# ANTIGRAVITY_AGENT) y, si no están, sube por la cadena de procesos (GCUENTAS_PROC, por defecto /proc).
+cuentas_agente() {
+    if [ -n "${CLAUDECODE-}" ]; then echo claude; return 0; fi
+    if [ -n "${CODEX_THREAD_ID-}" ]; then echo codex; return 0; fi
+    if [ -n "${ANTIGRAVITY_AGENT-}" ]; then echo agy; return 0; fi
+    local proc=${GCUENTAS_PROC:-/proc} p=$PPID siguiente nombre linea n=0
+    while [ "${p:-0}" -gt 1 ] && [ $n -lt 64 ]; do
+        [ -r "$proc/$p/comm" ] && [ -r "$proc/$p/status" ] || return 1
+        IFS= read -r nombre <"$proc/$p/comm"
+        case $nombre in claude | codex | agy) echo "$nombre"; return 0 ;; esac
+        siguiente=
+        while IFS= read -r linea; do
+            case $linea in PPid:*) siguiente=${linea#PPid:}; break ;; esac
+        done <"$proc/$p/status"
+        p=${siguiente//[[:space:]]/}
+        n=$((n + 1))
+    done
+    return 1
+}
+
 _gc_recortar() { # quita espacios al principio y al final, respeta los de dentro
     local s=$1
     s=${s#"${s%%[![:space:]]*}"}
