@@ -29,18 +29,16 @@ GC_NAV_PUERTO=""
 
 _gc_err() { printf 'gcuenta: %s\n' "$*" >&2; }
 
-# cuentas_agente → si la llamada viene de un agente (Claude Code, Codex o agy), escribe su nombre y
-# devuelve 0. Mira las variables que cada uno pone en sus comandos (CLAUDECODE, CODEX_THREAD_ID,
-# ANTIGRAVITY_AGENT) y, si no están, sube por la cadena de procesos (GCUENTAS_PROC, por defecto /proc).
-cuentas_agente() {
-    if [ -n "${CLAUDECODE-}" ]; then echo claude; return 0; fi
-    if [ -n "${CODEX_THREAD_ID-}" ]; then echo codex; return 0; fi
-    if [ -n "${ANTIGRAVITY_AGENT-}" ]; then echo agy; return 0; fi
+# _gc_agente_proceso → sube por la cadena de procesos (GCUENTAS_PROC, por defecto /proc) desde el padre y deja
+# en GC_AGENTE_PID y GC_AGENTE_NOMBRE el primer proceso de un agente («claude», «codex» o «agy»). Devuelve 1
+# si no hay ninguno.
+_gc_agente_proceso() {
     local proc=${GCUENTAS_PROC:-/proc} p=$PPID siguiente nombre linea n=0
+    GC_AGENTE_PID="" GC_AGENTE_NOMBRE=""
     while [ "${p:-0}" -gt 1 ] && [ $n -lt 64 ]; do
         [ -r "$proc/$p/comm" ] && [ -r "$proc/$p/status" ] || return 1
         IFS= read -r nombre <"$proc/$p/comm"
-        case $nombre in claude | codex | agy) echo "$nombre"; return 0 ;; esac
+        case $nombre in claude | codex | agy) GC_AGENTE_PID=$p GC_AGENTE_NOMBRE=$nombre; return 0 ;; esac
         siguiente=
         while IFS= read -r linea; do
             case $linea in PPid:*) siguiente=${linea#PPid:}; break ;; esac
@@ -49,6 +47,27 @@ cuentas_agente() {
         n=$((n + 1))
     done
     return 1
+}
+
+# cuentas_agente → si la llamada viene de un agente (Claude Code, Codex o agy), escribe su nombre y
+# devuelve 0. Mira las variables que cada uno pone en sus comandos (CLAUDECODE, CODEX_THREAD_ID,
+# ANTIGRAVITY_AGENT) y, si no están, sube por la cadena de procesos.
+cuentas_agente() {
+    if [ -n "${CLAUDECODE-}" ]; then echo claude; return 0; fi
+    if [ -n "${CODEX_THREAD_ID-}" ]; then echo codex; return 0; fi
+    if [ -n "${ANTIGRAVITY_AGENT-}" ]; then echo agy; return 0; fi
+    _gc_agente_proceso || return 1
+    echo "$GC_AGENTE_NOMBRE"
+}
+
+# cuentas_sesion_dir → escribe la carpeta donde se abrió la sesión del agente que hace la llamada: la del
+# proceso «claude», «codex» o «agy» más cercano, que no cambia aunque su shell haga cd. Las variables no sirven
+# aquí (se heredan: un Codex lanzado desde Claude trae CLAUDECODE). Devuelve 1 si no hay agente o carpeta.
+cuentas_sesion_dir() {
+    _gc_agente_proceso || return 1
+    local dir
+    dir=$(readlink -- "${GCUENTAS_PROC:-/proc}/$GC_AGENTE_PID/cwd" 2>/dev/null) && [ -d "$dir" ] || return 1
+    printf '%s' "$dir"
 }
 
 _gc_recortar() { # quita espacios al principio y al final, respeta los de dentro
@@ -176,8 +195,9 @@ cuentas_cargar() {
 
 # cuentas_resolver [ruta]
 # Deja en GC_ID la cuenta y en GC_MOTIVO por qué se eligió.
-#   - Sin ruta: manda GCUENTA si está definida; si no, la carpeta actual (pwd -P).
-#   - Con ruta: solo cuenta la ruta (GCUENTA no interviene).
+#   - Sin ruta: manda GCUENTA si está definida; si no, la carpeta actual (pwd -P). Si esa no tiene regla (~, el
+#     scratchpad, /tmp…) y la llamada viene de un agente, vale la carpeta donde se abrió su sesión.
+#   - Con ruta: solo cuenta la ruta (GCUENTA y la sesión no intervienen).
 # Gana el prefijo más largo, y solo en el límite de carpeta: la regla …/asociacion no captura
 # …/asociacion-ds. Los prefijos se canonicalizan con realpath, así que los symlinks
 # (/mnt/chromeos/shared → /mnt/shared, ~/dev/atajo → otra/carpeta) no engañan.
@@ -207,7 +227,7 @@ cuentas_resolver() {
     if [ ${#RUTAS_PREFIJO[@]} -gt 0 ] && [ -n "$ruta" ]; then
         mapfile -d '' -t canon < <(realpath -m -z -- "${RUTAS_PREFIJO[@]}" 2>/dev/null)
     fi
-    local i p mejor=-1 largo=-1
+    local i p mejor=-1 largo=-1 sesion
     for i in "${!canon[@]}"; do
         p=${canon[$i]%/}
         if [ "$ruta" = "$p" ] || [ -z "$p" ] || [[ $ruta == "$p"/* ]]; then
@@ -220,6 +240,9 @@ cuentas_resolver() {
     if [ $mejor -ge 0 ]; then
         GC_ID=${RUTAS_ID[$mejor]}
         GC_MOTIVO="ruta ${RUTAS_PREFIJO[$mejor]}"
+    elif [ -z "${1-}" ] && sesion=$(cuentas_sesion_dir) && [ "$sesion" != "$ruta" ] &&
+        cuentas_resolver "$sesion" && [ "$GC_MOTIVO" != defecto ]; then
+        GC_MOTIVO="carpeta de la sesión $sesion ($GC_MOTIVO)"
     else
         GC_ID=$CUENTA_DEFECTO
         GC_MOTIVO="defecto"

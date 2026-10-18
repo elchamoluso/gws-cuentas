@@ -85,4 +85,24 @@ r=$(cd "$T/borrada" && rmdir "$T/borrada" && "$g" id 2>&1; echo "código=$?")
 contiene "carpeta actual borrada → no adivina (código 2)" "código=2" "$r"
 contiene "…y lo explica" "la carpeta actual ya no existe" "$r"
 
+echo "Carpeta de la sesión (procesos de agente de verdad, por /proc):"
+# Un bash copiado con el nombre del agente es un proceso «claude» o «codex» de verdad: su carpeta es la de la
+# sesión, y las órdenes van en un subshell que hace cd sin moverla.
+mkdir -p "$T/bin"
+cp /bin/bash "$T/bin/claude"
+cp /bin/bash "$T/bin/codex"
+export G=$g FUERA=$T/fuera FORM ASOC T
+sesion() { # sesion <agente> <carpeta de la sesión> <orden, que corre dentro del agente>
+    (cd "$2" && GCUENTAS_PROC=/proc "$T/bin/$1" -c "$3")
+}
+esperar "desde una carpeta sin regla, la de la sesión" personal "$(sesion claude "$FORM" '(cd "$FUERA" && "$G" id)')"
+contiene "…y el motivo lo dice" "carpeta de la sesión $FORM (ruta $FORM)" "$(sesion claude "$FORM" '(cd "$FUERA" && "$G" cual)')"
+esperar "la regla de la carpeta actual gana a la sesión" asociacion "$(sesion claude "$FORM" '(cd "$ASOC" && "$G" id)')"
+esperar "sesión en una carpeta sin regla → defecto" empresa "$(sesion claude "$FUERA" '(cd /tmp && "$G" id)')"
+esperar "GCUENTA manda sobre la sesión" asociacion "$(sesion claude "$FORM" '(cd "$FUERA" && GCUENTA=asociacion "$G" id)')"
+esperar "con ruta explícita, la sesión no interviene" empresa "$(sesion claude "$FORM" '"$G" id "$FUERA"')"
+esperar "manda el agente más cercano (un codex abierto desde claude)" personal \
+    "$(sesion claude "$ASOC" '(cd "$FORM" && exec "$T/bin/codex" -c "(cd \"\$FUERA\" && \"\$G\" id)")')"
+esperar "sin agente en la cadena → defecto" empresa "$(cd "$FUERA" && "$g" id)"
+
 resumen

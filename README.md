@@ -40,7 +40,9 @@ de dos cuentas a N, añade gcloud y clasp, y hace que la elección sea automáti
 2. **Un shim** (`bin/cuenta-shim`) instalado en `~/.local/bin` como `gws`, `gcloud`, `gsutil`,
    `bq` y `clasp`. En cada llamada:
    - resuelve la cuenta: `GCUENTA` si está definida; si no, el prefijo más largo de las reglas
-     sobre `pwd -P`; si no, la cuenta por defecto;
+     sobre `pwd -P`; si la carpeta no tiene regla (`~`, `/tmp`, el scratchpad) y lo llama un agente
+     (Claude Code, Codex o agy), la de la carpeta donde se abrió su sesión, que es la carpeta del
+     proceso del agente más cercano en la cadena (`/proc`); si no, la cuenta por defecto;
    - prepara el entorno de esa cuenta y ejecuta el binario real;
    - no escribe nada en stdout.
 

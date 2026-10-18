@@ -13,7 +13,8 @@ que iniciar sesión ni cambiar de cuenta.
   cuenta en **cada llamada** con `pwd -P` y el prefijo más largo de las reglas. Si nada
   coincide, usa la cuenta por defecto.
 - El hook de inicio de sesión ya te ha dicho qué cuenta toca en la carpeta de la sesión. Si
-  cambias de carpeta, la cuenta cambia con ella.
+  cambias de carpeta, la cuenta cambia con ella. En una carpeta sin regla (`~`, `/tmp`, el
+  scratchpad) se queda la de la carpeta de la sesión, y `gcuenta` lo dice («carpeta de la sesión»).
 
 ## Reglas
 
