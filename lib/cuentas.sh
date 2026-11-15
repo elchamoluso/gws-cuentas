@@ -8,6 +8,9 @@
 # Formato de la configuración (una directiva por línea, campos separados por «|»):
 #   maquina|<nombre>                                   → nombre de la credencial OAuth en todas las cuentas: gws-<maquina>
 #   cuenta|<id>|<email>|<proyecto_gcp>|<workspace|personal>
+#   alias|<id>|<email>                                 → otra dirección de la misma cuenta, que también vale al
+#                                                        comprobar con qué cuenta se entró (tras cambiar la dirección
+#                                                        de una cuenta Google, Google da la vieja a algunos clientes OAuth)
 #   defecto|<id>                                       → cuenta si ninguna ruta coincide
 #   ruta|<prefijo>|<id>                                → carpeta (y todo lo que cuelga) → cuenta
 #   conectores|<id>                                    → cuenta ligada a los conectores de claude.ai
@@ -18,7 +21,9 @@ GCUENTAS_CONF="${GCUENTAS_CONF:-$HOME/.config/gws-cuentas/cuentas.conf}"
 GCUENTAS_CACHE="${GCUENTAS_CACHE:-$HOME/.cache/gws-cuentas}"
 
 CUENTAS_IDS=()
-declare -A CUENTA_EMAIL=() CUENTA_PROYECTO=() CUENTA_TIPO=()
+declare -A CUENTA_EMAIL=() CUENTA_PROYECTO=() CUENTA_TIPO=() CUENTA_ALIAS=()
+ALIAS_ID=()
+ALIAS_EMAIL=()
 RUTAS_PREFIJO=()
 RUTAS_ID=()
 CUENTA_DEFECTO=""
@@ -95,6 +100,18 @@ cuenta_existe() {
     return 1
 }
 
+# cuenta_es_email <id> <email> → 0 si el email es la dirección de la cuenta o uno de sus alias (sin
+# distinguir mayúsculas). Es la comprobación de «con qué cuenta se entró» de gcuenta estado y login.
+cuenta_es_email() {
+    local id=$1 email=${2,,} a
+    [ -n "$email" ] || return 1
+    [ "$email" = "${CUENTA_EMAIL[$id],,}" ] && return 0
+    for a in ${CUENTA_ALIAS[$id]:-}; do
+        [ "$email" = "$a" ] && return 0
+    done
+    return 1
+}
+
 cuentas_cargar() {
     if [ ! -r "$GCUENTAS_CONF" ]; then
         _gc_err "no encuentro la configuración $GCUENTAS_CONF (parte de config/cuentas.example.conf)"
@@ -132,6 +149,14 @@ cuentas_cargar() {
                 CUENTA_EMAIL[$a]=$b
                 CUENTA_PROYECTO[$a]=$c
                 CUENTA_TIPO[$a]=${d:-workspace}
+                ;;
+            alias)
+                if ! [[ $b =~ ^[^@[:space:]]+@[^@[:space:]]+$ ]]; then
+                    _gc_err "$GCUENTAS_CONF:$n: el alias de «$a» necesita un email válido (tiene «$b»)"
+                    return 2
+                fi
+                ALIAS_ID+=("$a")
+                ALIAS_EMAIL+=("$b")
                 ;;
             defecto) CUENTA_DEFECTO=$a ;;
             ruta)
@@ -174,6 +199,14 @@ cuentas_cargar() {
         _gc_err "$GCUENTAS_CONF: «defecto|<id>» falta o apunta a una cuenta que no existe"
         return 2
     fi
+    local i
+    for i in "${!ALIAS_ID[@]}"; do
+        if ! cuenta_existe "${ALIAS_ID[$i]}"; then
+            _gc_err "$GCUENTAS_CONF: un alias apunta a la cuenta «${ALIAS_ID[$i]}», que no existe"
+            return 2
+        fi
+        CUENTA_ALIAS[${ALIAS_ID[$i]}]+="${CUENTA_ALIAS[${ALIAS_ID[$i]}]:+ }${ALIAS_EMAIL[$i],,}"
+    done
     for id in "${RUTAS_ID[@]}"; do
         if ! cuenta_existe "$id"; then
             _gc_err "$GCUENTAS_CONF: una ruta apunta a la cuenta «$id», que no existe"

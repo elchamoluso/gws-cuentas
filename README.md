@@ -138,7 +138,7 @@ cd ~/dev/gws-cuentas
 ./install.sh             # la primera vez crea ~/.config/gws-cuentas/cuentas.conf desde el ejemplo
 $EDITOR ~/.config/gws-cuentas/cuentas.conf
 ./install.sh             # crea espacios, cepos, shims, skill y hook
-bash tests/resolver.sh && bash tests/shim.sh
+bash tests/resolver.sh && bash tests/shim.sh && bash tests/alias.sh
 ```
 
 La configuración (`config/cuentas.example.conf` tiene un ejemplo comentado):
@@ -146,11 +146,18 @@ La configuración (`config/cuentas.example.conf` tiene un ejemplo comentado):
 ```
 maquina|<nombre>                     # la credencial OAuth se llama gws-<nombre> en todas las cuentas
 cuenta|<id>|<email>|<proyecto_gcp>|<workspace|personal>
+alias|<id>|<email>                   # opcional: otra dirección de la misma cuenta, que también vale
 defecto|<id>
 ruta|<carpeta>|<id>
 conectores|<id>                      # opcional
 navegador|<perfil>|<puerto>          # opcional: por defecto ~/.agent-browser/perfiles/google y 9300
 ```
+
+**`alias`, para una cuenta que cambió de dirección.** Al cambiar la dirección de una cuenta Google, Google da la
+nueva a sus propios clientes (gcloud), pero a un cliente OAuth propio, como el de gws y clasp, le sigue dando la
+vieja. `gcuenta estado` y `gcuenta login` comparan la dirección con la que se entró con la de la cuenta, así que sin el
+alias siempre falla una de las dos partes. En `cuenta` va la dirección nueva y en `alias`, la vieja (visto el
+2026-11-15).
 
 ## Protocolo por cuenta
 
