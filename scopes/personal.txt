@@ -1,6 +1,8 @@
 # Scopes para cuentas personales @gmail.com (app Externa). Máximo 25 en total contando
 # los 3 que gws añade (openid, userinfo.email, userinfo.profile): aquí van 20.
 # Sin Chat ni Admin (no existen para cuentas personales).
+# Desde el 2026-11-15, gmail.settings.basic (los filtros de Gmail) va en lugar de
+# classroom.coursework.students, que es de profesor: https://mail.google.com/ no cubre los ajustes.
 https://www.googleapis.com/auth/drive
 https://www.googleapis.com/auth/spreadsheets
 https://www.googleapis.com/auth/documents
@@ -15,7 +17,7 @@ https://www.googleapis.com/auth/meetings.space.created
 https://www.googleapis.com/auth/classroom.courses
 https://www.googleapis.com/auth/classroom.rosters
 https://www.googleapis.com/auth/classroom.coursework.me
-https://www.googleapis.com/auth/classroom.coursework.students
+https://www.googleapis.com/auth/gmail.settings.basic
 https://www.googleapis.com/auth/classroom.courseworkmaterials
 https://www.googleapis.com/auth/classroom.announcements
 https://www.googleapis.com/auth/classroom.topics
